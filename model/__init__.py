@@ -51,6 +51,20 @@ from model.factories import (
     RobotConfigFactory,
     YHRGS1RobotConfigFactory,
 )
+from model.domain_randomization import (
+    Phase,
+    RandomizationContext,
+    IDomainRandomizer,
+    RANDOMIZER_REGISTRY,
+    randomizer,
+    randomize,
+    SizeRandomizer,
+    MassRandomizer,
+    FrictionRandomizer,
+    DomainRandomizationConfig,
+    DomainRandomizerManager,
+    get_rl_push_dr_config,
+)
 from model.pointcloud import (
     ISamplingStrategy,
     UniformSamplingStrategy,
@@ -102,6 +116,19 @@ __all__ = [
     # Factories
     "RobotConfigFactory",
     "YHRGS1RobotConfigFactory",
+    # Domain Randomization
+    "Phase",
+    "RandomizationContext",
+    "IDomainRandomizer",
+    "RANDOMIZER_REGISTRY",
+    "randomizer",
+    "randomize",
+    "SizeRandomizer",
+    "MassRandomizer",
+    "FrictionRandomizer",
+    "DomainRandomizationConfig",
+    "DomainRandomizerManager",
+    "get_rl_push_dr_config",
     # Point Cloud
     "ISamplingStrategy",
     "UniformSamplingStrategy",

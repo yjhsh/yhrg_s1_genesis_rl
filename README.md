@@ -6,16 +6,20 @@
 
 **Reinforcement-learning framework for non-prehensile robotic pushing with the YHRG S1 manipulator, built on the [Genesis](https://github.com/Genesis-Embodied-AI/Genesis) simulator and [rsl_rl](https://github.com/leggedrobotics/rsl_rl).**
 
-> For more details about **YHRG S1**, please refer to the official [S1_SDK](https://github.com/YHRG-Robotics/S1_SDK).
+For more details about **YHRG S1**, please refer to the official [S1_SDK](https://github.com/YHRG-Robotics/S1_SDK).
 
----
+> News:
+> 
+> 2026-09-11: Support for the Newton simulator is provided in the new project [yhrg_s1_newton_rl](https://github.com/yjhsh/yhrg_s1_newton_rl).
+
+
 
 ## Project Description
 
 This repository provides an end-to-end pipeline for training and evaluating a pushing policy:
 
 - **Simulation**: A single `gs.Scene` containing a ground plane, a fixed tabletop, a fixed-base 6-DoF YHRG S1 manipulator (loaded from URDF), and one movable cuboid. The scene is replicated into a grid of parallel environments via `scene.build(n_envs=...)`.
-- **Perception**: Each environment observes a point-cloud-derived centroid plus local poses of the end-effector, the cube, and the goal.
+- **Perception**: Each environment observes local poses of the end-effector, the cube, and the goal.
 - **Policy**: A multi-layer perceptron (MLP) actor-critic trained with PPO produces an 18-dimensional action consisting of a task-space pose offset and adaptive gain commands.
 - **Control**: A task-space controller converts the pose offset into joint-space targets via DLS inverse kinematics and applies adaptive PD gains.
 
@@ -23,7 +27,7 @@ The resulting policy learns to push the green cube to arbitrary goal positions (
 
 ![img](images/demo.gif)
 
----
+
 
 ## Environment
 
@@ -35,14 +39,17 @@ rsl-rl-lib==4.0.1
 torch==2.7.0+cu126
 ```
 
----
+
 
 ## Usage
 
 Train:
 
 ```bash
+# Normal training
 python rl_integration.py --num_envs 4096 --max_iterations 10000
+# Training with domain randomization
+python rl_integration.py --num_envs 2048 --max_iterations 10000 --dr-config config/dr_push.yaml
 ```
 
 Evaluate the example checkpoint:
@@ -51,7 +58,7 @@ Evaluate the example checkpoint:
 python rl_integration.py -e examples --eval --checkpoint model_9999.pt --num_envs 16 --max_iterations 1000 --vis
 ```
 
-The tensorboard log of example checkpoint is available at `logs/examples`.
+The tensorboard log of example checkpoint is available at `logs/examples`(without domain randomization), `logs/examples_dr` (with domain randomization).
 
 ### Command-line arguments
 
@@ -67,7 +74,7 @@ The tensorboard log of example checkpoint is available at `logs/examples`.
 | `--log_dir` | `logs` | Root directory for logs and checkpoints. |
 
 
----
+
 
 ## Project Structure
 
@@ -76,18 +83,17 @@ s1-genesis-rl/
 ├── rl_integration.py        # RL training/evaluation entry point (rsl_rl glue)
 ├── rl_push_env.py           # PushEnv: scene, observations, actions, rewards
 ├── config/                  # Scene/robot configuration dataclasses
-├── model/                   # Robot config, loaders, point-cloud, state
+├── model/                   # Robot config, loaders, state
 ├── controller/              # Task-space controller, IK solver, vision
 ├── view/                    # Visualization utilities
 └── asset/                   # URDF / mesh / texture assets
 ```
----
+
 
 ## Acknowledgments
 
 - **[Genesis](https://github.com/Genesis-Embodied-AI/Genesis)** — The embodied-AI world simulator that powers all physics and rendering.
 - **[rsl_rl](https://github.com/leggedrobotics/rsl_rl)** — The production-grade PPO implementation used for on-policy training.
-- **[pytorch3d](https://github.com/facebookresearch/pytorch3d)** — Point-cloud farthest-point sampling used for the perception centroid.
 - **[shifu](https://github.com/42jaylonw/shifu)** - RL reward design.
 - The **YHRG S1** manipulator hardware/URDF model.
 

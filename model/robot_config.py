@@ -236,6 +236,12 @@ def get_rl_push_scene_profile() -> SceneProfile:
 class ObjectRandomizer:
     """Object randomization strategy configuration.
 
+    .. deprecated::
+        Superseded by :mod:`model.domain_randomization`, which exposes each
+        randomized quantity as a registered :class:`IDomainRandomizer` and is
+        configured through :class:`DomainRandomizationConfig`. Kept only for
+        backwards compatibility with external callers.
+
     Each randomization can be toggled independently. Provides an interface to
     query per-environment randomization parameters.
     Future extension: loading random objects (different URDF/Mesh) can be added

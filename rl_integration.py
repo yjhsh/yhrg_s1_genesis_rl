@@ -10,10 +10,17 @@ Usage (in sam3 conda environment):
     python rl_integration.py
     python rl_integration.py --num_envs 32 --max_iterations 2000
     python rl_integration.py --vis   # with viewer
-    
+
+    # Training with domain randomization
+    python rl_integration.py --dr size,mass,friction
+    python rl_integration.py --dr-config config/dr_push.yaml
+
     # Evaluation
     python rl_integration.py --eval --checkpoint model_2999.pt
     python rl_integration.py --eval --checkpoint model_2999.pt --num_episodes 10
+
+Note: the DR configuration must be identical between training and evaluation;
+omitting --dr / --dr-config reproduces the pre-DR (nominal) baseline.
 """
 
 import argparse
@@ -26,6 +33,11 @@ from rsl_rl.runners import OnPolicyRunner
 import genesis as gs
 
 from rl_push_env import PushEnv
+from model.domain_randomization import (
+    DomainRandomizationConfig,
+    RANDOMIZER_REGISTRY,
+    get_rl_push_dr_config,
+)
 
 
 # ─────────────────── rsl_rl 4.x training config ───────────────────
@@ -91,6 +103,35 @@ def get_train_cfg(exp_name: str, max_iterations: int) -> dict:
     }
 
 
+# ─────────────────── domain randomization config ───────────────────
+
+def build_dr_config(args) -> DomainRandomizationConfig:
+    """Assemble the DR config: defaults < --dr-config file < --dr name list.
+
+    Randomization stays opt-in: without any flag every randomizer keeps its
+    ``enabled: False`` default, i.e. behaviour is bit-identical to pre-DR runs.
+    """
+    specs = get_rl_push_dr_config().to_dict()
+
+    if args.dr_config:  # full spec (ranges + enable flags) from YAML
+        specs.update(DomainRandomizationConfig.from_yaml(args.dr_config).to_dict())
+
+    requested = [s.strip() for s in args.dr.split(",")]
+    requested = [s for s in requested if s]
+    if "all" in requested:
+        requested = list(specs.keys())
+
+    for name in requested:
+        if name not in RANDOMIZER_REGISTRY:
+            raise ValueError(
+                f"Unknown domain randomizer: '{name}'. "
+                f"Available: {RANDOMIZER_REGISTRY.get_available()}"
+            )
+        specs.setdefault(name, {})["enabled"] = True
+
+    return DomainRandomizationConfig.from_dict(specs)
+
+
 # ─────────────────── main ───────────────────
 
 def main():
@@ -107,6 +148,13 @@ def main():
                         help="Path to checkpoint file for evaluation (e.g., model_2999.pt)")
     parser.add_argument("--num_episodes", type=int, default=10,
                         help="Number of evaluation episodes")
+
+    # Domain randomization arguments
+    parser.add_argument("--dr", type=str, default="",
+                        help="Comma-separated randomizers to enable "
+                             "(size,mass,friction or 'all'); empty disables DR")
+    parser.add_argument("--dr-config", type=str, default=None,
+                        help="YAML file with the full DR spec, e.g. config/dr_push.yaml")
     args = parser.parse_args()
 
     # ── initialise Genesis ──
@@ -118,10 +166,16 @@ def main():
         performance_mode=True,
     )
 
+    # ── domain randomization ──
+    dr_config = build_dr_config(args)
+    enabled_dr = [name for name, spec in dr_config.specs.items() if spec.get("enabled")]
+    print(f"[DR] enabled: {enabled_dr if enabled_dr else 'none (nominal baseline)'}")
+
     # ── create environment ──
     env = PushEnv(
         num_envs=args.num_envs,
         show_viewer=args.vis,
+        dr_config=dr_config,
     )
 
     # ── training config ──
@@ -136,6 +190,10 @@ def main():
 
         with open(os.path.join(log_dir, "cfgs.pkl"), "wb") as f:
             pickle.dump(train_cfg, f)
+
+        # Persist the DR spec so a run can be reproduced / evaluated exactly
+        with open(os.path.join(log_dir, "dr_config.pkl"), "wb") as f:
+            pickle.dump(dr_config.to_dict(), f)
 
     # ── launch OnPolicyRunner ──
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)

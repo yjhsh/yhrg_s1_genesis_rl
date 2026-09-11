@@ -41,6 +41,8 @@ External dependencies (used as-is, no modifications):
 """
 
 import math
+from typing import Any, Dict, Optional
+
 import torch
 from tensordict import TensorDict
 
@@ -62,9 +64,14 @@ from model.robot_config import (
     RL_PUSH_DEFAULT_POSITION,
     get_rl_push_profile,
     get_rl_push_scene_profile,
-    get_rl_push_object_randomizer,
     get_rl_push_success_config,
-    ObjectRandomizer,
+)
+from model.domain_randomization import (
+    Phase,
+    DomainRandomizationConfig,
+    DomainRandomizerManager,
+    get_rl_push_dr_config,
+    randomize,
 )
 from model.pointcloud import (
     PointCloudProcessor,
@@ -113,10 +120,13 @@ class PushEnv:
         ctrl_dt: float = 0.01,
         episode_length_s: float = 5.0,
         action_scale: float = 0.30,
-        object_randomizer: ObjectRandomizer = None,
+        dr_config: Optional[DomainRandomizationConfig] = None,
     ) -> None:
         self.num_envs = num_envs
-        self.num_obs = 32
+        # The 3D point-cloud centroid is currently DISABLED as a policy input:
+        # self._current_pcd is an object-local cloud that is never updated during
+        # an episode, so its centroid is a ~1e-4 m constant (see _compute_obs).
+        self.num_obs = 29  # 32 - 3 (centroid excluded, code kept below)
         self.num_actions = 18
         self.device = gs.device
 
@@ -139,6 +149,12 @@ class PushEnv:
 
         # ── Success config (from Model layer) ──
         self.success_config = get_rl_push_success_config()
+
+        # ── Domain randomization (from Model layer) ──
+        # dr_state must exist before the first @randomize hook runs.
+        self.dr_config = dr_config or get_rl_push_dr_config()
+        self.dr_manager = DomainRandomizerManager(self.dr_config)
+        self.dr_state: Dict[str, Any] = {}
 
         # ── build scene ──
         self.scene = gs.Scene(
@@ -186,36 +202,9 @@ class PushEnv:
         )
 
         # push target cube (dynamic, spawned on table surface)
-        # ── Object randomizer ──
-        self.obj_randomizer = object_randomizer or get_rl_push_object_randomizer()
-        sampled_sizes = self.obj_randomizer.sample_sizes(num_envs)
-
-        # Z height: use max possible size to ensure no penetration
-        obj_z = self.obj_randomizer.get_max_obj_z(sp.table_top_z, sp.z_eps)
-
-        # Check if heterogeneous entity is needed (multiple distinct sizes)
-        unique_sizes = set(sampled_sizes)
-        if self.obj_randomizer.size_enabled and len(unique_sizes) > 1:
-            # Heterogeneous entity: pass morph list for per-env size variation
-            morphs = [gs.morphs.Box(size=s, pos=(0.0, 0.0, obj_z), fixed=False) for s in sampled_sizes]
-            self.cube = self.scene.add_entity(
-                morphs,
-                surface=gs.surfaces.Rough(
-                    diffuse_texture=gs.textures.ColorTexture(color=(0.2, 0.8, 0.2)),
-                ),
-            )
-        else:
-            # Single size (original logic)
-            self.cube = self.scene.add_entity(
-                gs.morphs.Box(
-                    pos=(0.0, 0.0, obj_z),
-                    size=sp.cube_size,
-                    fixed=False,
-                ),
-                surface=gs.surfaces.Rough(
-                    diffuse_texture=gs.textures.ColorTexture(color=(0.2, 0.8, 0.2)),
-                ),
-            )
+        # Decorated with @randomize(Phase.SPAWN): spawn-time randomizers run
+        # first and publish their sampled spec into self.dr_state.
+        self.cube = self._spawn_object()
 
         # Goal marker (visualization only): thin red square on the table top.
         # fixed=True + collision=False -> pure visual entity, never affects physics.
@@ -233,13 +222,11 @@ class PushEnv:
             ),
         )
 
-        # Store per-env sizes and randomization state
-        self._sampled_sizes = sampled_sizes
-        self._sampled_masses = None
-        self._sampled_frictions = None
-
         # build with parallel envs on rectangular grid (2m spacing)
         self.scene.build(n_envs=num_envs, env_spacing=self.ENV_SPACING)
+
+        # ── One-time post-build randomization setup (e.g. base friction) ──
+        self.dr_manager.prepare(self.cube)
 
         # ── DOF indices ──
         self.motor_dof_idx = torch.tensor(
@@ -261,10 +248,6 @@ class PushEnv:
             torch.tensor(profile.force_lower, dtype=gs.tc_float, device=gs.device),
             torch.tensor(profile.force_upper, dtype=gs.tc_float, device=gs.device),
         )
-
-        # ── Set base friction on cube (for friction ratio randomization) ──
-        if self.obj_randomizer.friction_enabled:
-            self.cube.set_friction(self.obj_randomizer.base_friction)
 
         # ── Task-space controller (DLS IK + Adaptive PD) ──
         self.task_ctrl = TaskSpaceController(
@@ -288,9 +271,13 @@ class PushEnv:
         self.pc_processor = PointCloudProcessor(self.pc_config)
 
         # Per-env object sizes tensor for point cloud sampling
-        # Initialize from sampled_sizes (set during object creation above)
-        self._obj_sizes = torch.tensor(
-            self._sampled_sizes, dtype=gs.tc_float, device=gs.device
+        # Taken from the spawn-phase randomization state (falls back to the
+        # profile's nominal cube size when size randomization is disabled).
+        sampled_sizes = self.dr_state.get("size")
+        self._obj_sizes = (
+            sampled_sizes
+            if sampled_sizes is not None
+            else torch.tensor(sp.cube_size, dtype=gs.tc_float, device=gs.device).repeat(num_envs, 1)
         )  # [n_envs, 3]
 
         # Current point cloud buffer
@@ -363,6 +350,44 @@ class PushEnv:
             "action_penalty": torch.zeros((self.num_envs,), dtype=gs.tc_float, device=gs.device),
         }
 
+    # ────────────────────── object spawning + domain randomization ──────────────────────
+
+    @property
+    def dr_entity(self):
+        """Entity targeted by domain randomization (None before it is created)."""
+        return getattr(self, "cube", None)
+
+    @randomize(Phase.SPAWN)
+    def _spawn_object(self):
+        """Create the push-object entity (must run before ``scene.build()``).
+
+        Spawn randomizers (``SizeRandomizer``) have already written their spec
+        into ``self.dr_state`` when this body runs:
+
+            morph_sizes: List[Tuple[float, float, float]] — per-env box size
+            obj_z: float — spawn height that avoids table penetration
+
+        Genesis cannot resize geoms after build, so multiple distinct sizes are
+        realized through a heterogeneous entity (one morph per environment).
+        """
+        sp = self.scene_profile
+        sizes = self.dr_state.get("morph_sizes") or [sp.cube_size] * self.num_envs
+        obj_z = self.dr_state.get("obj_z", sp.obj_z)
+
+        surface = gs.surfaces.Rough(
+            diffuse_texture=gs.textures.ColorTexture(color=(0.2, 0.8, 0.2)),
+        )
+
+        if len(set(sizes)) > 1:
+            # Heterogeneous entity: one morph per env for per-env size variation
+            morphs = [gs.morphs.Box(size=s, pos=(0.0, 0.0, obj_z), fixed=False) for s in sizes]
+            return self.scene.add_entity(morphs, surface=surface)
+
+        return self.scene.add_entity(
+            gs.morphs.Box(pos=(0.0, 0.0, obj_z), size=sizes[0], fixed=False),
+            surface=surface,
+        )
+
     # ────────────────────── reset ──────────────────────
 
     def reset(self) -> tuple:
@@ -373,8 +398,14 @@ class PushEnv:
         self._compute_obs()
         return self.get_observations()
 
+    @randomize(Phase.RESET)
     def _reset_idx(self, envs_idx) -> None:
-        """Reset selected environments."""
+        """Reset selected environments.
+
+        Decorated with @randomize(Phase.RESET): mass / friction randomizers run
+        before the body, so per-episode physical properties are already applied
+        when the object pose is written.
+        """
         num_reset = envs_idx.sum().item() if envs_idx.dtype == torch.bool else len(envs_idx)
         if num_reset == 0:
             self.extras["log"] = {}
@@ -410,7 +441,7 @@ class PushEnv:
         rand_xy = torch.rand(num_reset, 2, device=self.device)
         obj_xy = self.obj_pos_low + rand_xy * (self.obj_pos_high - self.obj_pos_low)
         # Z height: use max possible size to ensure no penetration for all variants
-        obj_z_val = self.obj_randomizer.get_max_obj_z(self.scene_profile.table_top_z, self.scene_profile.z_eps)
+        obj_z_val = self.dr_state.get("obj_z", self.scene_profile.obj_z)
         obj_z = torch.full((num_reset, 1), obj_z_val, device=self.device)
         cube_pos_subset = torch.cat([obj_xy, obj_z], dim=-1)
         if is_bool_idx:
@@ -436,42 +467,8 @@ class PushEnv:
             cube_quat = cube_quat_subset
         self.cube.set_quat(cube_quat, envs_idx=envs_idx)
 
-        # ── Mass randomization ──
-        mass_tensor = self.obj_randomizer.sample_masses(num_reset, self.device)
-        if mass_tensor is not None:
-            # Build full-batch tensor for Genesis set_* (see cube_pos note above)
-            if is_bool_idx:
-                mass_2d = torch.zeros(self.num_envs, 1, device=self.device)
-                mass_2d[envs_idx] = mass_tensor.unsqueeze(-1)
-            else:
-                mass_2d = mass_tensor.unsqueeze(-1)  # (num_reset, 1) — single-link entity
-            self.cube.set_links_inertial_mass(mass_2d, links_idx_local=0, envs_idx=envs_idx)
-            # Store for query interface
-            if self._sampled_masses is None:
-                self._sampled_masses = torch.zeros(self.num_envs, device=self.device)
-            if envs_idx.dtype == torch.bool:
-                self._sampled_masses[envs_idx] = mass_tensor
-            else:
-                self._sampled_masses[envs_idx] = mass_tensor
-
-        # ── Friction randomization ──
-        friction_ratio = self.obj_randomizer.sample_friction_ratios(num_reset, self.device)
-        if friction_ratio is not None:
-            # Build full-batch tensor for Genesis set_* (see cube_pos note above)
-            if is_bool_idx:
-                ratio_2d = torch.zeros(self.num_envs, 1, device=self.device)
-                ratio_2d[envs_idx] = friction_ratio.unsqueeze(-1)
-            else:
-                ratio_2d = friction_ratio.unsqueeze(-1)  # (num_reset, 1) — single-link entity
-            self.cube.set_friction_ratio(ratio_2d, links_idx_local=0, envs_idx=envs_idx)
-            # Store absolute friction for query interface
-            if self._sampled_frictions is None:
-                self._sampled_frictions = torch.zeros(self.num_envs, device=self.device)
-            abs_friction = friction_ratio * self.obj_randomizer.base_friction
-            if envs_idx.dtype == torch.bool:
-                self._sampled_frictions[envs_idx] = abs_friction
-            else:
-                self._sampled_frictions[envs_idx] = abs_friction
+        # NOTE: mass / friction randomization is applied by the
+        # @randomize(Phase.RESET) hook above — see model/domain_randomization.py.
 
         # ── Randomise goal position ──
         # Ensure goal is at least MIN_INIT_DIST away from cube to avoid trivial success
@@ -780,7 +777,7 @@ class PushEnv:
     # ────────────────────── observations ──────────────────────
 
     def _compute_obs(self) -> None:
-        """Observation vector (dim = 32), all in environment-local coordinates.
+        """Observation vector (dim = 29), all in environment-local coordinates.
 
         Genesis guarantees: get_pos() returns local coordinates (excludes envs_offset).
         All positions are relative to each environment's own origin (robot base).
@@ -795,7 +792,7 @@ class PushEnv:
           [15:17] Cube→Goal vector (local XY)
           [17:23] Arm joint positions (6)
           [23:29] Arm joint velocities (6)
-          [29:32] Point cloud centroid (local XYZ)
+          [29:32] Point cloud centroid (local XYZ) — DISABLED, not fed to the policy
         """
         ee_pos = self._get_ee_pos()       # local coords
         ee_quat = self._get_ee_quat()     # local coords
@@ -807,7 +804,8 @@ class PushEnv:
         qpos = self.robot.get_qpos()[:, :self.ARM_DOF]
         qvel = self.robot.get_dofs_velocity()[:, :self.ARM_DOF]
 
-        # Point cloud centroid
+        # Point cloud centroid — computed but NOT fed to the policy (see
+        # self.num_obs).  Kept so it can be re-enabled with a one-line change.
         if self.pc_config.enabled:
             centroid = PointCloudProcessor.compute_centroid(self._current_pcd)  # [n_envs, 3]
         else:
@@ -823,7 +821,8 @@ class PushEnv:
             cube_to_goal,      # 2  — local
             qpos,              # 6  — joint positions
             qvel,              # 6  — joint velocities
-            centroid,          # 3  — point cloud centroid
+            # centroid,        # 3  — DISABLED: object-local cloud, constant per
+                               #      episode -> uninformative (num_obs = 29)
         ], dim=-1)
 
     # ────────────────────── rsl_rl 4.x interface ──────────────────────
@@ -846,18 +845,13 @@ class PushEnv:
         """Query per-env object randomization parameters.
 
         Returns:
-            dict with keys:
-                sizes: List[Tuple[float,float,float]] — per-env object sizes
-                masses: torch.Tensor or None — per-env mass (n_envs,)
-                frictions: torch.Tensor or None — per-env friction coefficient (n_envs,)
-                randomizer: ObjectRandomizer — the randomization strategy config
+            dict with the per-env caches written by the enabled randomizers:
+                size: torch.Tensor or None — [n_envs, 3] object sizes
+                mass: torch.Tensor or None — [n_envs] mass (kg)
+                friction: torch.Tensor or None — [n_envs] friction coefficient
+            plus ``config`` (the active DomainRandomizationConfig).
         """
-        return {
-            "sizes": self._sampled_sizes,
-            "masses": self._sampled_masses,
-            "frictions": self._sampled_frictions,
-            "randomizer": self.obj_randomizer,
-        }
+        return {**self.dr_state, "config": self.dr_config}
 
     # ────────────────────── point cloud query ──────────────────────
 

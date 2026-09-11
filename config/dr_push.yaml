@@ -1,0 +1,25 @@
+# Domain randomization spec for the YHRG S1 RL pushing task.
+#
+# Use with:  python rl_integration.py --dr-config config/dr_push.yaml
+#
+# Keys are randomizer names; every other key is a dataclass field of the
+# corresponding randomizer (see model/domain_randomization.py).
+#   size     -> SizeRandomizer     (SPAWN phase, fixed for the whole run)
+#   mass     -> MassRandomizer     (RESET phase, re-sampled every episode)
+#   friction -> FrictionRandomizer (RESET phase, ratio over `base`)
+
+size:
+  enabled: true
+  low: 0.8          # scale factor relative to the nominal 4cm cube
+  high: 2.0
+
+mass:
+  enabled: true
+  low: 0.05         # kg
+  high: 0.5
+
+friction:
+  enabled: true
+  low: 0.3          # actual friction; Genesis constraint: 0.01 <= actual <= 5.0
+  high: 1.0
+  base: 0.5         # set once after build, randomized as ratio = actual / base
