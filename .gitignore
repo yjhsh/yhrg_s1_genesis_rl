@@ -11,9 +11,7 @@ env/
 *.out
 *.svg
 *.png
-logs/
 docs/
-asset/
 tests/
 images/
 
