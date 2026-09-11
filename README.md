@@ -6,9 +6,13 @@
 
 **Reinforcement-learning framework for non-prehensile robotic pushing with the YHRG S1 manipulator, built on the [Genesis](https://github.com/Genesis-Embodied-AI/Genesis) simulator and [rsl_rl](https://github.com/leggedrobotics/rsl_rl).**
 
-> For more details about **YHRG S1**, please refer to the official [S1_SDK](https://github.com/YHRG-Robotics/S1_SDK).
+For more details about **YHRG S1**, please refer to the official [S1_SDK](https://github.com/YHRG-Robotics/S1_SDK).
 
----
+> News:
+> 
+> 2026-09-11: Support for the Newton simulator is provided in the new project [yhrg_s1_newton_rl](https://github.com/yjhsh/yhrg_s1_newton_rl).
+
+
 
 ## Project Description
 
@@ -23,7 +27,7 @@ The resulting policy learns to push the green cube to arbitrary goal positions (
 
 ![img](images/demo.gif)
 
----
+
 
 ## Environment
 
@@ -35,14 +39,17 @@ rsl-rl-lib==4.0.1
 torch==2.7.0+cu126
 ```
 
----
+
 
 ## Usage
 
 Train:
 
 ```bash
+# Normal training
 python rl_integration.py --num_envs 4096 --max_iterations 10000
+# Training with domain randomization
+python rl_integration.py --num_envs 2048 --max_iterations 10000 --dr-config config/dr_push.yaml
 ```
 
 Evaluate the example checkpoint:
@@ -51,7 +58,7 @@ Evaluate the example checkpoint:
 python rl_integration.py -e examples --eval --checkpoint model_9999.pt --num_envs 16 --max_iterations 1000 --vis
 ```
 
-The tensorboard log of example checkpoint is available at `logs/examples`.
+The tensorboard log of example checkpoint is available at `logs/examples`(without domain randomization), `logs/examples_dr` (with domain randomization).
 
 ### Command-line arguments
 
@@ -67,7 +74,7 @@ The tensorboard log of example checkpoint is available at `logs/examples`.
 | `--log_dir` | `logs` | Root directory for logs and checkpoints. |
 
 
----
+
 
 ## Project Structure
 
@@ -81,7 +88,7 @@ s1-genesis-rl/
 ├── view/                    # Visualization utilities
 └── asset/                   # URDF / mesh / texture assets
 ```
----
+
 
 ## Acknowledgments
 
